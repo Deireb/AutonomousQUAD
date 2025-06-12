@@ -13,7 +13,7 @@ This repository contains three C++ programs demonstrating autonomous drone behav
 
 ## Prerequisites
 - **MAVSDK** (Core, Action, Telemetry, Offboard plugins)  
-- **OpenCV** (>= 4.11) 
+- **OpenCV** (>= 4.11) & GStreamer
 - **libgpiod** (for ultrasonic sensor)  
 - C++17 compiler, CMake
 
