@@ -7,6 +7,7 @@ Faculty: School of Aeronautical Engineering
 Project: Final Year Project
 Supervisor: Pedro Orgeira Crespo
 Description: main mission where the drone flies forward, avoids frontal obstacles by changing altitude, and lands after covering a set distance.
+Note: This version does not include the ultrasonic sensor, as it is unnecessary for the test site. For further information regarding integration, please contact me.
 */
 
 #include <iostream>
