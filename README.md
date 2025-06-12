@@ -19,8 +19,8 @@ This repository contains three C++ programs demonstrating autonomous drone behav
 
 ## Building
 ```bash
-git clone https://github.com/Deireb/Autonomous-quadcopter---TFG.git
-cd Autonomous-quadcopter---TFG
+git clone https://github.com/Deireb/AutonomousQUAD.git
+cd AutonomousQUAD
 mkdir build && cd build
 cmake ..
 make
