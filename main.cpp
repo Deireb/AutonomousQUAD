@@ -16,7 +16,6 @@ Note: This version does not include the ultrasonic sensor, as it is unnecessary 
 #include <thread>
 #include <algorithm>
 #include <opencv2/opencv.hpp>
-#include <opencv2/ximgproc.hpp>
 #include "inference.h"
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/action/action.h>
@@ -36,6 +35,11 @@ static constexpr float MISSION_DISTANCE_M  = 10.0f;
 static constexpr float ALT_TOL             = 0.05f;   
 static constexpr auto  LOOP_DELAY          = 100ms;
 
+// Safety parameters
+static constexpr auto  TAKEOFF_TIMEOUT     = 15s;   // max time to reach cruise altitude after takeoff
+static constexpr auto  LANDING_TIMEOUT     = 60s;   // max time waiting for touchdown before disarm attempt
+static constexpr int   MAX_FRAME_FAILURES  = 5;     // consecutive failed camera reads before aborting
+
 // Experimental constant
 static constexpr float K_DISPARITY = 72.1f;
 
@@ -50,6 +54,25 @@ double haversine(double lat1, double lon1, double lat2, double lon2) {
     double a = sin(dLat/2)*sin(dLat/2)
              + cos(lat1)*cos(lat2)*sin(dLon/2)*sin(dLon/2);
     return R * 2 * atan2(sqrt(a), sqrt(1-a));
+}
+
+// Abort the mission: leave offboard (if active), land and disarm once on the ground
+void abort_and_land(Action& action, Offboard& offboard, Telemetry& telemetry, const string& reason) {
+    cerr << "[ABORT] " << reason << " Aterrizando.\n";
+    if (offboard.is_active()) {
+        offboard.stop();
+    }
+    if (action.land() != Action::Result::Success) {
+        cerr << "[ERROR] El comando de aterrizaje ha fallado.\n";
+        return;
+    }
+    const auto t0 = steady_clock::now();
+    while (telemetry.in_air() && steady_clock::now() - t0 < LANDING_TIMEOUT) {
+        this_thread::sleep_for(500ms);
+    }
+    if (!telemetry.in_air()) {
+        action.disarm();
+    }
 }
 
 // Load stereo rectification maps
@@ -113,6 +136,14 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    // Initialize vision (before arming, so a missing model fails on the ground)
+    Inference inf("yolo11n.onnx", cv::Size(640,640), "", false);
+    auto stereo = cv::StereoSGBM::create(
+        0, 16*8, 5, 8*3*5*5, 32*3*5*5,
+        1, 10, 100, 2, 31,
+        cv::StereoSGBM::MODE_SGBM_3WAY
+    );
+
     // Connect to autopilot
     Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
     string connection_url = (argc > 2
@@ -139,15 +170,32 @@ int main(int argc, char** argv) {
 
     // Take off to cruise altitude
     action.set_takeoff_altitude(CRUISE_ALT_M);
-    action.arm();
-    action.takeoff();
-    while (telemetry.position().relative_altitude_m < CRUISE_ALT_M - 0.1f) {
-        this_thread::sleep_for(100ms);
+    if (action.arm() != Action::Result::Success) {
+        cerr << "[ERROR] No se pudo armar el dron.\n";
+        return -1;
+    }
+    if (action.takeoff() != Action::Result::Success) {
+        cerr << "[ERROR] El comando de despegue ha fallado.\n";
+        action.disarm();
+        return -1;
+    }
+    {
+        const auto t0 = steady_clock::now();
+        while (telemetry.position().relative_altitude_m < CRUISE_ALT_M - 0.1f) {
+            if (steady_clock::now() - t0 > TAKEOFF_TIMEOUT) {
+                abort_and_land(action, offboard, telemetry, "Timeout alcanzando la altitud de despegue.");
+                return -1;
+            }
+            this_thread::sleep_for(100ms);
+        }
     }
 
     // Start offboard control
     offboard.set_velocity_ned({0,0,0, telemetry.attitude_euler().yaw_deg});
-    offboard.start();
+    if (offboard.start() != Offboard::Result::Success) {
+        abort_and_land(action, offboard, telemetry, "No se pudo iniciar el modo offboard.");
+        return -1;
+    }
 
     // Adjust exactly to cruise altitude
     {
@@ -164,117 +212,131 @@ int main(int argc, char** argv) {
              << CRUISE_ALT_M << " m ± " << ALT_TOL << " m.\n";
     }
 
-    // Initialize vision and state
-    Inference inf("yolo11n.onnx", cv::Size(640,640), "", false);
+    // Initialize mission state
     double startLat = telemetry.position().latitude_deg;
     double startLon = telemetry.position().longitude_deg;
     State state = State::FLY;
     steady_clock::time_point hold_start{};
-    auto stereo = cv::StereoSGBM::create(
-        0, 16*8, 5, 8*3*5*5, 32*3*5*5,
-        1, 10, 100, 2, 31,
-        cv::StereoSGBM::MODE_SGBM_3WAY
-    );
 
     // Main mission loop
-    while (state != State::FINISHED) {
-        auto pos = telemetry.position();
-        double travelled = haversine(startLat, startLon, pos.latitude_deg, pos.longitude_deg);
+    int frame_failures = 0;
+    try {
+        while (state != State::FINISHED) {
+            auto pos = telemetry.position();
+            double travelled = haversine(startLat, startLon, pos.latitude_deg, pos.longitude_deg);
 
-        // Capture and rectify frames, compute disparity
-        cv::Mat fL, fR, rL, rR, grayL, grayR, disp16, disp32;
-        capL.read(fL); capR.read(fR);
-        cv::remap(fL, rL, Lx, Ly, cv::INTER_LINEAR);
-        cv::remap(fR, rR, Rx, Ry, cv::INTER_LINEAR);
-        cv::cvtColor(rL, grayL, cv::COLOR_BGR2GRAY);
-        cv::cvtColor(rR, grayR, cv::COLOR_BGR2GRAY);
-        stereo->compute(grayL, grayR, disp16);
-        disp16.convertTo(disp32, CV_32F, 1.0/16.0f);
+            // Capture and rectify frames, compute disparity
+            cv::Mat fL, fR, rL, rR, grayL, grayR, disp16, disp32;
+            const bool okL = capL.read(fL);
+            const bool okR = capR.read(fR);
+            if (!okL || !okR || fL.empty() || fR.empty()) {
+                if (++frame_failures >= MAX_FRAME_FAILURES) {
+                    abort_and_land(action, offboard, telemetry, "Fallo continuado en la lectura de las cámaras.");
+                    return -1;
+                }
+                // Hold position while waiting for a valid frame
+                if (offboard.is_active()) {
+                    offboard.set_velocity_ned({0,0,0, telemetry.attitude_euler().yaw_deg});
+                }
+                this_thread::sleep_for(LOOP_DELAY);
+                continue;
+            }
+            frame_failures = 0;
+            cv::remap(fL, rL, Lx, Ly, cv::INTER_LINEAR);
+            cv::remap(fR, rR, Rx, Ry, cv::INTER_LINEAR);
+            cv::cvtColor(rL, grayL, cv::COLOR_BGR2GRAY);
+            cv::cvtColor(rR, grayR, cv::COLOR_BGR2GRAY);
+            stereo->compute(grayL, grayR, disp16);
+            disp16.convertTo(disp32, CV_32F, 1.0/16.0f);
 
-        auto dets = inf.runInference(rR);
-        float min_dist = detect_obstacle(dets, disp32);
+            auto dets = inf.runInference(rR);
+            float min_dist = detect_obstacle(dets, disp32);
         
-        // State machine for flight, avoidance, and landing
-        switch (state) {
-            case State::FLY: {
-                if (min_dist < DETECT_THRESHOLD_M) {
-                    cout << "[DETECCIÓN] Objeto a " << min_dist
-                         << " m. Parando y subiendo a " << OBSTACLE_ALT_M << " m.\n";
-                    offboard.set_velocity_ned({0,0,0, telemetry.attitude_euler().yaw_deg});
-                    state = State::ASCEND;
-                } else if (pos.relative_altitude_m > CRUISE_ALT_M + ALT_TOL) {
-                    cout << "[INFO] Demasiado alto, descendiendo a crucero.\n";
-                    state = State::DESCEND;
-                } else if (travelled >= MISSION_DISTANCE_M) {
-                    cout << "[INFO] Misión completada, aterrizando.\n";
-                    offboard.stop();
-                    action.land();
-                    state = State::LAND;
-                } else {
-                    float alt_error = CRUISE_ALT_M - pos.relative_altitude_m;
-                    float down_speed = (fabs(alt_error) > ALT_TOL)
-                                       ? clamp(-1.0f * alt_error, -0.5f, 0.5f)
-                                       : 0.0f;
-                    Offboard::VelocityNedYaw cmd{};
-                    cmd.north_m_s = FORWARD_SPEED_M_S;
-                    cmd.east_m_s  = 0.0f;
-                    cmd.down_m_s  = down_speed;
-                    cmd.yaw_deg   = telemetry.attitude_euler().yaw_deg;
-                    offboard.set_velocity_ned(cmd);
+            // State machine for flight, avoidance, and landing
+            switch (state) {
+                case State::FLY: {
+                    if (min_dist < DETECT_THRESHOLD_M) {
+                        cout << "[DETECCIÓN] Objeto a " << min_dist
+                             << " m. Parando y subiendo a " << OBSTACLE_ALT_M << " m.\n";
+                        offboard.set_velocity_ned({0,0,0, telemetry.attitude_euler().yaw_deg});
+                        state = State::ASCEND;
+                    } else if (pos.relative_altitude_m > CRUISE_ALT_M + ALT_TOL) {
+                        cout << "[INFO] Demasiado alto, descendiendo a crucero.\n";
+                        state = State::DESCEND;
+                    } else if (travelled >= MISSION_DISTANCE_M) {
+                        cout << "[INFO] Misión completada, aterrizando.\n";
+                        offboard.stop();
+                        action.land();
+                        state = State::LAND;
+                    } else {
+                        float alt_error = CRUISE_ALT_M - pos.relative_altitude_m;
+                        float down_speed = (fabs(alt_error) > ALT_TOL)
+                                           ? clamp(-1.0f * alt_error, -0.5f, 0.5f)
+                                           : 0.0f;
+                        Offboard::VelocityNedYaw cmd{};
+                        cmd.north_m_s = FORWARD_SPEED_M_S;
+                        cmd.east_m_s  = 0.0f;
+                        cmd.down_m_s  = down_speed;
+                        cmd.yaw_deg   = telemetry.attitude_euler().yaw_deg;
+                        offboard.set_velocity_ned(cmd);
+                    }
+                    break;
                 }
-                break;
+                case State::ASCEND: {
+                    if (pos.relative_altitude_m < OBSTACLE_ALT_M - ALT_TOL) {
+                        offboard.set_velocity_ned({0,0,-0.4f, telemetry.attitude_euler().yaw_deg});
+                    } else {
+                        // Llegado a altitud de evasión: iniciar HOLD
+                        hold_start = steady_clock::now();
+                        cout << "[INFO] Altitud de evasión alcanzada. Manteniendo durante 3s.\n";
+                        state = State::HOLD;
+                    }
+                    break;
+                }
+                case State::HOLD: {
+                    auto now = steady_clock::now();
+                    // si sigue detectando, resetear temporizador
+                    if (min_dist < DETECT_THRESHOLD_M) {
+                        hold_start = now;
+                    }
+                    auto elapsed = duration_cast<seconds>(now - hold_start).count();
+                    if (elapsed < 3) {
+                        // mantener altitud de evasión
+                        float alt_error = OBSTACLE_ALT_M - pos.relative_altitude_m;
+                        float down_speed = clamp(-1.0f * alt_error, -0.5f, 0.5f);
+                        offboard.set_velocity_ned({FORWARD_SPEED_M_S, 0, down_speed, telemetry.attitude_euler().yaw_deg});
+                    } else {
+                        cout << "[INFO] Hold finalizado. Reanudando crucero.\n";
+                        state = State::FLY;
+                    }
+                    break;
+                }
+                case State::DESCEND: {
+                    if (pos.relative_altitude_m > CRUISE_ALT_M + ALT_TOL) {
+                        offboard.set_velocity_ned({0,0,0.3f, telemetry.attitude_euler().yaw_deg});
+                    } else {
+                        offboard.set_velocity_ned({0,0,0, telemetry.attitude_euler().yaw_deg});
+                        cout << "[INFO] Altura de crucero restaurada.\n";
+                        state = State::FLY;
+                    }
+                    break;
+                }
+                case State::LAND:
+                    while (telemetry.in_air()) {
+                        this_thread::sleep_for(500ms);
+                    }
+                    action.disarm();
+                    state = State::FINISHED;
+                    break;
+                default:
+                    break;
             }
-            case State::ASCEND: {
-                if (pos.relative_altitude_m < OBSTACLE_ALT_M - ALT_TOL) {
-                    offboard.set_velocity_ned({0,0,-0.4f, telemetry.attitude_euler().yaw_deg});
-                } else {
-                    // Llegado a altitud de evasión: iniciar HOLD
-                    hold_start = steady_clock::now();
-                    cout << "[INFO] Altitud de evasión alcanzada. Manteniendo durante 3s.\n";
-                    state = State::HOLD;
-                }
-                break;
-            }
-            case State::HOLD: {
-                auto now = steady_clock::now();
-                // si sigue detectando, resetear temporizador
-                if (min_dist < DETECT_THRESHOLD_M) {
-                    hold_start = now;
-                }
-                auto elapsed = duration_cast<seconds>(now - hold_start).count();
-                if (elapsed < 3) {
-                    // mantener altitud de evasión
-                    float alt_error = OBSTACLE_ALT_M - pos.relative_altitude_m;
-                    float down_speed = clamp(-1.0f * alt_error, -0.5f, 0.5f);
-                    offboard.set_velocity_ned({FORWARD_SPEED_M_S, 0, down_speed, telemetry.attitude_euler().yaw_deg});
-                } else {
-                    cout << "[INFO] Hold finalizado. Reanudando crucero.\n";
-                    state = State::FLY;
-                }
-                break;
-            }
-            case State::DESCEND: {
-                if (pos.relative_altitude_m > CRUISE_ALT_M + ALT_TOL) {
-                    offboard.set_velocity_ned({0,0,0.3f, telemetry.attitude_euler().yaw_deg});
-                } else {
-                    offboard.set_velocity_ned({0,0,0, telemetry.attitude_euler().yaw_deg});
-                    cout << "[INFO] Altura de crucero restaurada.\n";
-                    state = State::FLY;
-                }
-                break;
-            }
-            case State::LAND:
-                while (telemetry.in_air()) {
-                    this_thread::sleep_for(500ms);
-                }
-                action.disarm();
-                state = State::FINISHED;
-                break;
-            default:
-                break;
-        }
 
-        this_thread::sleep_for(LOOP_DELAY);
+            this_thread::sleep_for(LOOP_DELAY);
+        }
+    } catch (const exception& e) {
+        abort_and_land(action, offboard, telemetry, string("Excepción en el bucle principal: ") + e.what());
+        return -1;
     }
 
     cout << "[INFO] Secuencia terminada\n";
